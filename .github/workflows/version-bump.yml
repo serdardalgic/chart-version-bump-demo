@@ -1,0 +1,290 @@
+name: Version Bump
+
+# Automated Chart.yaml version bump + CHANGELOG.md finalization.
+#
+# Two entry points, one core bump/changelog/commit flow:
+#   - `/merge` comment on an approved PR (with write access)      -> bump + finalize CHANGELOG + merge commit into base branch
+#   - workflow_dispatch break-glass trigger, any branch, no PR    -> bump (+ optional changelog_note entry)
+#
+# Security note: this workflow reacts to issue_comment, which runs with the
+# base repo's GITHUB_TOKEN (contents: write, pull-requests: write) even for
+# PRs from forks/branches. To avoid ever executing PR-branch-controlled code
+# with that token, every job that needs .github/scripts/* checks those
+# scripts out from the default branch specifically (never from the PR head),
+# even in jobs that also check out the PR branch to edit Chart.yaml/CHANGELOG.md.
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      target_branch:
+        description: 'Branch to bump directly (no PR involved)'
+        type: string
+        default: main
+        required: false
+      changelog_note:
+        description: 'Optional CHANGELOG.md entry text (one bullet per line). Leave blank to only bump Chart.yaml.'
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  LABEL_NO_BUMP: no-version-bump
+  LABEL_MINOR: minor-bump
+  LABEL_MAJOR: major-bump
+
+jobs:
+  guard:
+    name: Guard (trigger match + single-run serialization)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+    outputs:
+      should_run: ${{ steps.trigger.outputs.should_run }}
+      is_pr_trigger: ${{ steps.trigger.outputs.is_pr_trigger }}
+      pr_number: ${{ steps.trigger.outputs.pr_number }}
+    steps:
+      - name: Determine whether this run should proceed
+        id: trigger
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "is_pr_trigger=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          trimmed=$(printf '%s' "$COMMENT_BODY" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          if [ "$trimmed" != "/merge" ]; then
+            echo "Comment is not exactly '/merge'; nothing to do."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "is_pr_trigger=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "is_pr_trigger=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Reject if another run is already active
+        if: steps.trigger.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          IS_PR_TRIGGER: ${{ steps.trigger.outputs.is_pr_trigger }}
+          PR_NUMBER: ${{ steps.trigger.outputs.pr_number }}
+        run: |
+          other_runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "version-bump.yml" \
+            --json databaseId,status --jq \
+            "[.[] | select((.status==\"in_progress\" or .status==\"queued\") and .databaseId != ${RUN_ID})] | length")
+
+          if [ "$other_runs" -gt 0 ]; then
+            echo "Another version-bump run is already active repo-wide; rejecting this one (no queueing)." >&2
+            if [ "$IS_PR_TRIGGER" = "true" ]; then
+              gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "\`/merge\` rejected: another version-bump workflow run is already in progress repo-wide. Retry once it finishes (or ask an admin to cancel it if it looks stuck)."
+            fi
+            exit 1
+          fi
+
+  validate_pr:
+    name: Validate /merge preconditions
+    needs: guard
+    if: needs.guard.outputs.should_run == 'true' && needs.guard.outputs.is_pr_trigger == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+    outputs:
+      skip_bump: ${{ steps.info.outputs.skip_bump }}
+      bump_type: ${{ steps.info.outputs.bump_type }}
+      head_branch: ${{ steps.info.outputs.head_branch }}
+      head_sha: ${{ steps.info.outputs.head_sha }}
+      base_branch: ${{ steps.info.outputs.base_branch }}
+    steps:
+      - name: Checkout default branch (trusted scripts only, never the PR branch)
+        uses: actions/checkout@v5
+
+      - name: Fetch PR details
+        run: |
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json headRefName,headRefOid,baseRefName,labels,reviews > /tmp/pr.json
+
+      - name: Check commenter has write access
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission)
+          echo "commenter permission: $permission"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "@$COMMENTER \`/merge\` was ignored: you need write access to this repository to merge via \`/merge\`."
+              exit 1
+              ;;
+          esac
+
+      - name: Check PR has an approval
+        run: |
+          base_branch=$(jq -r .baseRefName /tmp/pr.json)
+          case "$base_branch" in
+            test/*)
+              echo "Base branch '$base_branch' matches the test/* convention; skipping the approval requirement."
+              exit 0
+              ;;
+          esac
+
+          approvals=$(jq '[.reviews | group_by(.author.login)[] | max_by(.submittedAt) | select(.state=="APPROVED")] | length' /tmp/pr.json)
+          if [ "$approvals" -lt 1 ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body '`/merge` rejected: this PR needs at least 1 approval before it can be merged.'
+            exit 1
+          fi
+
+      - name: Check PR is mergeable
+        run: |
+          mergeable="UNKNOWN"
+          for attempt in 1 2 3 4 5; do
+            mergeable=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json mergeable --jq .mergeable)
+            [ "$mergeable" != "UNKNOWN" ] && break
+            sleep 3
+          done
+          if [ "$mergeable" != "MERGEABLE" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body '`/merge` rejected: this PR is not mergeable (merge conflicts, or GitHub could not determine mergeability in time). Resolve conflicts and try again.'
+            exit 1
+          fi
+
+      - name: Check labels and compute bump type
+        id: info
+        run: |
+          has_no_bump=$(jq --arg lbl "$LABEL_NO_BUMP" '[.labels[].name] | any(. == $lbl)' /tmp/pr.json)
+          has_minor=$(jq --arg lbl "$LABEL_MINOR" '[.labels[].name] | any(. == $lbl)' /tmp/pr.json)
+          has_major=$(jq --arg lbl "$LABEL_MAJOR" '[.labels[].name] | any(. == $lbl)' /tmp/pr.json)
+
+          if [ "$has_no_bump" = "true" ] && { [ "$has_minor" = "true" ] || [ "$has_major" = "true" ]; }; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "\`/merge\` rejected: \`$LABEL_NO_BUMP\` and \`$LABEL_MINOR\`/\`$LABEL_MAJOR\` are mutually exclusive, remove one of the two labels."
+            exit 1
+          fi
+          if [ "$has_minor" = "true" ] && [ "$has_major" = "true" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "\`/merge\` rejected: \`$LABEL_MINOR\` and \`$LABEL_MAJOR\` are mutually exclusive, remove one of the two labels."
+            exit 1
+          fi
+
+          bump_type="patch"
+          [ "$has_minor" = "true" ] && bump_type="minor"
+          [ "$has_major" = "true" ] && bump_type="major"
+
+          echo "skip_bump=$has_no_bump" >> "$GITHUB_OUTPUT"
+          echo "bump_type=$bump_type" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$(jq -r .headRefName /tmp/pr.json)" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r .headRefOid /tmp/pr.json)" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$(jq -r .baseRefName /tmp/pr.json)" >> "$GITHUB_OUTPUT"
+
+      - name: "Check ## Unreleased has a bullet on the PR head"
+        if: steps.info.outputs.skip_bump == 'false'
+        env:
+          HEAD_SHA: ${{ steps.info.outputs.head_sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/contents/CHANGELOG.md?ref=${HEAD_SHA}" --jq '.content' \
+            | base64 -d > /tmp/CHANGELOG.md
+
+          if ! python3 .github/scripts/changelog_tool.py check-unreleased /tmp/CHANGELOG.md; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "\`/merge\` rejected: \`CHANGELOG.md\` needs a \`## Unreleased\` heading (exact spelling/case, no extra spacing) with at least one non-empty bullet under it. Add your change there and retry \`/merge\` -- or apply the \`$LABEL_NO_BUMP\` label if this PR genuinely needs neither."
+            exit 1
+          fi
+
+  bump:
+    name: Bump Chart.yaml / CHANGELOG.md
+    needs: [guard, validate_pr]
+    if: |
+      always() &&
+      needs.guard.outputs.should_run == 'true' &&
+      (
+        (needs.guard.outputs.is_pr_trigger == 'true' && needs.validate_pr.result == 'success' && needs.validate_pr.outputs.skip_bump == 'false') ||
+        (needs.guard.outputs.is_pr_trigger != 'true')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch to bump (PR head, or dispatch target branch)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.guard.outputs.is_pr_trigger == 'true' && needs.validate_pr.outputs.head_branch || github.event.inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Checkout trusted scripts from default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: _trusted
+          sparse-checkout: |
+            .github/scripts
+
+      - name: Bump Chart.yaml version
+        id: bump
+        env:
+          BUMP_TYPE: ${{ needs.guard.outputs.is_pr_trigger == 'true' && needs.validate_pr.outputs.bump_type || github.event.inputs.bump_type }}
+        run: |
+          NEW_VERSION=$(python3 _trusted/.github/scripts/bump_chart_version.py Chart.yaml --bump-type "$BUMP_TYPE")
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize CHANGELOG.md (PR path)
+        if: needs.guard.outputs.is_pr_trigger == 'true'
+        run: |
+          python3 _trusted/.github/scripts/changelog_tool.py finalize CHANGELOG.md --version "${{ steps.bump.outputs.new_version }}"
+
+      - name: Insert CHANGELOG.md entry (dispatch path, optional note)
+        if: needs.guard.outputs.is_pr_trigger != 'true' && github.event.inputs.changelog_note != ''
+        env:
+          NOTE: ${{ github.event.inputs.changelog_note }}
+        run: |
+          python3 _trusted/.github/scripts/changelog_tool.py insert-entry CHANGELOG.md --version "${{ steps.bump.outputs.new_version }}" --note "$NOTE"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Chart.yaml CHANGELOG.md
+          git commit -m "Bump chart version to ${{ steps.bump.outputs.new_version }}"
+          git push
+
+  merge-pr:
+    name: Merge PR
+    needs: [guard, validate_pr, bump]
+    if: |
+      always() &&
+      needs.guard.outputs.should_run == 'true' &&
+      needs.guard.outputs.is_pr_trigger == 'true' &&
+      needs.validate_pr.result == 'success' &&
+      (needs.bump.result == 'success' || needs.bump.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge PR (merge commit, not squash)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+        run: |
+          if ! gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "\`/merge\` bumped the version but merging the PR failed. Check the workflow run logs and merge manually if needed."
+            exit 1
+          fi
