@@ -81,6 +81,20 @@ jobs:
           echo "is_pr_trigger=true" >> "$GITHUB_OUTPUT"
           echo "pr_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
 
+      - name: Reject if the PR is not open
+        if: steps.trigger.outputs.should_run == 'true' && steps.trigger.outputs.is_pr_trigger == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+          PR_NUMBER: ${{ steps.trigger.outputs.pr_number }}
+        run: |
+          if [ "$ISSUE_STATE" != "open" ]; then
+            echo "PR #$PR_NUMBER is not open (state: $ISSUE_STATE); ignoring /merge." >&2
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "\`/merge\` ignored: this PR is already closed."
+            exit 1
+          fi
+
       - name: Reject if another run is already active
         if: steps.trigger.outputs.should_run == 'true'
         env:
